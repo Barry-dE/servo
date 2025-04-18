@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
+use std::cell::{LazyCell, RefCell};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
+use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::{mem, thread};
 
@@ -11,6 +13,8 @@ use compositing_traits::{CrossProcessCompositorApi, SerializableImageData};
 use imsz::imsz_from_reader;
 use ipc_channel::ipc::IpcSharedMemory;
 use log::{debug, warn};
+use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
+use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{
     ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder, ImageResponse,
     PendingImageId, UsePlaceholder,
@@ -18,12 +22,19 @@ use net_traits::image_cache::{
 use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
 use pixels::{CorsStatus, Image, ImageMetadata, PixelFormat, load_from_memory};
+use profile_traits::mem::{Report, ReportKind};
+use profile_traits::path;
 use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{ImageDescriptor, ImageDescriptorFlags, ImageFormat};
 
 use crate::resource_thread::CoreResourceThreadPool;
+
+// We bake in rippy.png as a fallback, in case the embedder does not provide
+// a rippy resource. this version is 253 bytes large, don't exchange it against
+// something in higher resolution.
+const FALLBACK_RIPPY: &[u8] = include_bytes!("../../resources/rippy.png");
 
 //
 // TODO(gw): Remaining work on image cache:
@@ -45,7 +56,9 @@ fn decode_bytes_sync(key: LoadKey, bytes: &[u8], cors: CorsStatus) -> DecoderMsg
 }
 
 fn get_placeholder_image(compositor_api: &CrossProcessCompositorApi, data: &[u8]) -> Arc<Image> {
-    let mut image = load_from_memory(data, CorsStatus::Unsafe).unwrap();
+    let mut image = load_from_memory(data, CorsStatus::Unsafe)
+        .or_else(|| load_from_memory(FALLBACK_RIPPY, CorsStatus::Unsafe))
+        .expect("load fallback image failed");
     set_webrender_image_key(compositor_api, &mut image);
     Arc::new(image)
 }
@@ -98,6 +111,7 @@ type ImageKey = (ServoUrl, ImmutableOrigin, Option<CorsSettings>);
 
 // Represents all the currently pending loads/decodings. For
 // performance reasons, loads are indexed by a dedicated load key.
+#[derive(MallocSizeOf)]
 struct AllPendingLoads {
     // The loads, indexed by a load key. Used during most operations,
     // for performance reasons.
@@ -180,6 +194,7 @@ enum CacheResult<'a> {
 /// Images that fail to load (due to network or decode
 /// failure) are still stored here, so that they aren't
 /// fetched again.
+#[derive(MallocSizeOf)]
 struct CompletedLoad {
     image_response: ImageResponse,
     id: PendingImageId,
@@ -197,9 +212,10 @@ struct DecoderMsg {
     image: Option<Image>,
 }
 
+#[derive(MallocSizeOf)]
 enum ImageBytes {
     InProgress(Vec<u8>),
-    Complete(Arc<Vec<u8>>),
+    Complete(#[conditional_malloc_size_of] Arc<Vec<u8>>),
 }
 
 impl ImageBytes {
@@ -234,6 +250,7 @@ impl ImageBytes {
 // A key used to communicate during loading.
 type LoadKey = PendingImageId;
 
+#[derive(MallocSizeOf)]
 struct LoadKeyGenerator {
     counter: u64,
 }
@@ -257,6 +274,7 @@ enum LoadResult {
 
 /// Represents an image that is either being loaded
 /// by the resource thread, or decoded by a worker thread.
+#[derive(MallocSizeOf)]
 struct PendingLoad {
     /// The bytes loaded so far. Reset to an empty vector once loading
     /// is complete and the buffer has been transmitted to the decoder.
@@ -315,6 +333,7 @@ impl PendingLoad {
 // ======================================================================
 // Image cache implementation.
 // ======================================================================
+#[derive(MallocSizeOf)]
 struct ImageCacheStore {
     // Images that are loading over network, or decoding.
     pending_loads: AllPendingLoads,
@@ -323,12 +342,14 @@ struct ImageCacheStore {
     completed_loads: HashMap<ImageKey, CompletedLoad>,
 
     // The placeholder image used when an image fails to load
+    #[conditional_malloc_size_of]
     placeholder_image: Arc<Image>,
 
     // The URL used for the placeholder image
     placeholder_url: ServoUrl,
 
     // Cross-process compositor API instance.
+    #[ignore_malloc_size_of = "Channel from another crate"]
     compositor_api: CrossProcessCompositorApi,
 }
 
@@ -439,6 +460,22 @@ impl ImageCache for ImageCacheImpl {
         }
     }
 
+    fn memory_report(&self, prefix: &str) -> Report {
+        let seen_pointer =
+            move |ptr| SEEN_POINTERS.with(|pointers| !pointers.borrow_mut().insert(ptr));
+        let mut ops = MallocSizeOfOps::new(
+            servo_allocator::usable_size,
+            None,
+            Some(Box::new(seen_pointer)),
+        );
+        let size = self.store.lock().unwrap().size_of(&mut ops);
+        Report {
+            path: path![prefix, "image-cache"],
+            kind: ReportKind::ExplicitSystemHeapSize,
+            size,
+        }
+    }
+
     fn get_image(
         &self,
         url: ServoUrl,
@@ -546,7 +583,8 @@ impl ImageCache for ImageCacheImpl {
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg) {
         match (action, id) {
             (FetchResponseMsg::ProcessRequestBody(..), _) |
-            (FetchResponseMsg::ProcessRequestEOF(..), _) => (),
+            (FetchResponseMsg::ProcessRequestEOF(..), _) |
+            (FetchResponseMsg::ProcessCspViolations(..), _) => (),
             (FetchResponseMsg::ProcessResponse(_, response), _) => {
                 debug!("Received {:?} for {:?}", response.as_ref().map(|_| ()), id);
                 let mut store = self.store.lock().unwrap();
@@ -640,3 +678,7 @@ impl ImageCacheImpl {
         warn!("Couldn't find cached entry for listener {:?}", id);
     }
 }
+
+thread_local!(static SEEN_POINTERS: LazyCell<RefCell<HashSet<*const c_void>>> = const {
+    LazyCell::new(|| RefCell::new(HashSet::new()))
+});
