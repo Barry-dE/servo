@@ -12755,6 +12755,13 @@
       {}
      ]
     ],
+    "background_image_csp.sub.html": [
+     "c326f54de52c6a36cbaf4871c947c5b785cac83d",
+     [
+      null,
+      {}
+     ]
+    ],
     "binding_keyword.html": [
      "818d2aa29471026c1b4215dfcd1b9939a052b1ea",
      [
@@ -12873,6 +12880,13 @@
       ]
      ]
     },
+    "css-image-batch-callbacks.html": [
+     "c449b8bab01d27a41bd1ba472ce6b38d0fa768b0",
+     [
+      null,
+      {}
+     ]
+    ],
     "custom_auto_rooter.html": [
      "3d6f04e85b27bcf957b273e04e4a80b75e714b2f",
      [
@@ -13524,7 +13538,7 @@
      ]
     ],
     "interfaces.worker.js": [
-     "8af942c0f99218fb39770cdcf299eaa230339010",
+     "8d109502622fac7266a4564de09684a3ab94118c",
      [
       "mozilla/interfaces.worker.html",
       {}
@@ -14166,6 +14180,13 @@
     },
     "variadic-interface.html": [
      "5ab0557c5e02828c38f5c58edde5425e40dcb4b1",
+     [
+      null,
+      {}
+     ]
+    ],
+    "video_poster_csp.sub.html": [
+     "cc5dfd54c1e39904d5c919f6bd6840d65dcc0fa8",
      [
       null,
       {}

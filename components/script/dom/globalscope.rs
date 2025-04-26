@@ -22,7 +22,7 @@ use constellation_traits::{
     ScriptToConstellationChan, ScriptToConstellationMessage,
 };
 use content_security_policy::{
-    CheckResult, CspList, PolicyDisposition, Violation, ViolationResource,
+    CheckResult, CspList, PolicyDisposition, PolicySource, Violation, ViolationResource,
 };
 use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg};
@@ -30,6 +30,8 @@ use dom_struct::dom_struct;
 use embedder_traits::{
     EmbedderMsg, GamepadEvent, GamepadSupportedHapticEffects, GamepadUpdateType,
 };
+use http::HeaderMap;
+use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use js::glue::{IsWrapper, UnwrapObjectDynamic};
@@ -2415,6 +2417,41 @@ impl GlobalScope {
         unreachable!();
     }
 
+    /// <https://www.w3.org/TR/CSP/#initialize-document-csp>
+    pub(crate) fn parse_csp_list_from_metadata(
+        headers: &Option<Serde<HeaderMap>>,
+    ) -> Option<CspList> {
+        // TODO: Implement step 1 (local scheme special case)
+        let headers = headers.as_ref()?;
+        let mut csp = headers.get_all("content-security-policy").iter();
+        // This silently ignores the CSP if it contains invalid Unicode.
+        // We should probably report an error somewhere.
+        let c = csp.next().and_then(|c| c.to_str().ok())?;
+        let mut csp_list = CspList::parse(c, PolicySource::Header, PolicyDisposition::Enforce);
+        for c in csp {
+            let c = c.to_str().ok()?;
+            csp_list.append(CspList::parse(
+                c,
+                PolicySource::Header,
+                PolicyDisposition::Enforce,
+            ));
+        }
+        let csp_report = headers
+            .get_all("content-security-policy-report-only")
+            .iter();
+        // This silently ignores the CSP if it contains invalid Unicode.
+        // We should probably report an error somewhere.
+        for c in csp_report {
+            let c = c.to_str().ok()?;
+            csp_list.append(CspList::parse(
+                c,
+                PolicySource::Header,
+                PolicyDisposition::Report,
+            ));
+        }
+        Some(csp_list)
+    }
+
     /// Get the [base url](https://html.spec.whatwg.org/multipage/#api-base-url)
     /// for this global scope.
     pub(crate) fn api_base_url(&self) -> ServoUrl {
@@ -2799,36 +2836,16 @@ impl GlobalScope {
         }))
     }
 
-    #[allow(unsafe_code)]
-    pub(crate) fn is_js_evaluation_allowed(&self, cx: SafeJSContext) -> bool {
+    pub(crate) fn is_js_evaluation_allowed(&self, source: &str) -> bool {
         let Some(csp_list) = self.get_csp_list() else {
             return true;
         };
 
-        let scripted_caller = unsafe { describe_scripted_caller(*cx) }.unwrap_or_default();
-        let is_js_evaluation_allowed = csp_list.is_js_evaluation_allowed() == CheckResult::Allowed;
+        let (is_js_evaluation_allowed, violations) = csp_list.is_js_evaluation_allowed(source);
 
-        if !is_js_evaluation_allowed {
-            // FIXME: Don't fire event if `script-src` and `default-src`
-            // were not passed.
-            for policy in csp_list.0 {
-                let report = CSPViolationReportBuilder::default()
-                    .resource("eval".to_owned())
-                    .effective_directive("script-src".to_owned())
-                    .report_only(policy.disposition == PolicyDisposition::Report)
-                    .source_file(scripted_caller.filename.clone())
-                    .line_number(scripted_caller.line)
-                    .column_number(scripted_caller.col)
-                    .build(self);
-                let task = CSPViolationReportTask::new(self, report);
+        self.report_csp_violations(violations);
 
-                self.task_manager()
-                    .dom_manipulation_task_source()
-                    .queue(task);
-            }
-        }
-
-        is_js_evaluation_allowed
+        is_js_evaluation_allowed == CheckResult::Allowed
     }
 
     pub(crate) fn create_image_bitmap(
@@ -2857,15 +2874,11 @@ impl GlobalScope {
                     return p;
                 }
 
-                if let Some((data, size)) = canvas.fetch_all_data() {
-                    let data = data
-                        .map(|data| data.to_vec())
-                        .unwrap_or_else(|| vec![0; size.area() as usize * 4]);
-
+                if let Some(snapshot) = canvas.get_image_data() {
+                    let size = snapshot.size().cast();
                     let image_bitmap =
                         ImageBitmap::new(self, size.width, size.height, can_gc).unwrap();
-
-                    image_bitmap.set_bitmap_data(data);
+                    image_bitmap.set_bitmap_data(snapshot.to_vec());
                     image_bitmap.set_origin_clean(canvas.origin_is_clean());
                     p.resolve_native(&(image_bitmap), can_gc);
                 }
@@ -2878,14 +2891,11 @@ impl GlobalScope {
                     return p;
                 }
 
-                if let Some((data, size)) = canvas.fetch_all_data() {
-                    let data = data
-                        .map(|data| data.to_vec())
-                        .unwrap_or_else(|| vec![0; size.area() as usize * 4]);
-
+                if let Some(snapshot) = canvas.get_image_data() {
+                    let size = snapshot.size().cast();
                     let image_bitmap =
                         ImageBitmap::new(self, size.width, size.height, can_gc).unwrap();
-                    image_bitmap.set_bitmap_data(data);
+                    image_bitmap.set_bitmap_data(snapshot.to_vec());
                     image_bitmap.set_origin_clean(canvas.origin_is_clean());
                     p.resolve_native(&(image_bitmap), can_gc);
                 }
@@ -3089,10 +3099,10 @@ impl GlobalScope {
 
     /// <https://www.w3.org/TR/CSP/#get-csp-of-object>
     pub(crate) fn get_csp_list(&self) -> Option<CspList> {
-        if self.downcast::<Window>().is_some() {
+        if self.downcast::<Window>().is_some() || self.downcast::<WorkerGlobalScope>().is_some() {
             return self.policy_container().csp_list;
         }
-        // TODO: Worker and Worklet global scopes.
+        // TODO: Worklet global scopes.
         None
     }
 
@@ -3352,7 +3362,7 @@ impl GlobalScope {
 
         let data = structuredclone::write(cx, value, Some(guard))?;
 
-        structuredclone::read(self, data, retval).map_err(|_| Error::DataClone(None))?;
+        structuredclone::read(self, data, retval)?;
 
         Ok(())
     }
@@ -3448,19 +3458,32 @@ impl GlobalScope {
         unreachable!();
     }
 
+    #[allow(unsafe_code)]
     pub(crate) fn report_csp_violations(&self, violations: Vec<Violation>) {
+        let scripted_caller =
+            unsafe { describe_scripted_caller(*GlobalScope::get_cx()) }.unwrap_or_default();
         for violation in violations {
             let (sample, resource) = match violation.resource {
-                ViolationResource::Inline { .. } => (None, "inline".to_owned()),
+                ViolationResource::Inline { sample } => (sample, "inline".to_owned()),
                 ViolationResource::Url(url) => (None, url.into()),
                 ViolationResource::TrustedTypePolicy { sample } => {
                     (Some(sample), "trusted-types-policy".to_owned())
                 },
+                ViolationResource::TrustedTypeSink { sample } => {
+                    (Some(sample), "trusted-types-sink".to_owned())
+                },
+                ViolationResource::Eval { sample } => (sample, "eval".to_owned()),
+                ViolationResource::WasmEval => (None, "wasm-eval".to_owned()),
             };
             let report = CSPViolationReportBuilder::default()
                 .resource(resource)
                 .sample(sample)
                 .effective_directive(violation.directive.name)
+                .original_policy(violation.policy.to_string())
+                .report_only(violation.policy.disposition == PolicyDisposition::Report)
+                .source_file(scripted_caller.filename.clone())
+                .line_number(scripted_caller.line)
+                .column_number(scripted_caller.col + 1)
                 .build(self);
             let task = CSPViolationReportTask::new(self, report);
             self.task_manager()

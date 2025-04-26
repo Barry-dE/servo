@@ -8,7 +8,7 @@ use std::sync::Arc;
 use content_security_policy as csp;
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
-use html5ever::{LocalName, Prefix, local_name, namespace_url, ns};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use ipc_channel::ipc;
 use js::rust::HandleObject;
 use net_traits::image_cache::{
@@ -233,8 +233,10 @@ impl HTMLVideoElement {
         .credentials_mode(CredentialsMode::Include)
         .use_url_credentials(true)
         .origin(document.origin().immutable().clone())
-        .pipeline_id(Some(document.global().pipeline_id()));
-
+        .pipeline_id(Some(document.global().pipeline_id()))
+        .insecure_requests_policy(document.insecure_requests_policy())
+        .has_trustworthy_ancestor_origin(document.has_trustworthy_ancestor_origin())
+        .policy_container(document.policy_container().to_owned());
         // Step 5.
         // This delay must be independent from the ones created by HTMLMediaElement during
         // its media load algorithm, otherwise a code like

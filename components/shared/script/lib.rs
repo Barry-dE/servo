@@ -20,7 +20,7 @@ use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    AnimationTickType, LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
+    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
     StructuredSerializedData, WindowSizeType,
 };
 use crossbeam_channel::{RecvTimeoutError, Sender};
@@ -47,8 +47,8 @@ use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::WebGPUMsg;
+use webrender_api::ImageKey;
 use webrender_api::units::DevicePixel;
-use webrender_api::{DocumentId, ImageKey};
 
 /// The initial data required to create a new layout attached to an existing script thread.
 #[derive(Debug, Deserialize, Serialize)]
@@ -195,7 +195,7 @@ pub enum ScriptThreadMessage {
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
     /// Notifies script thread that all animations are done
-    TickAllAnimations(PipelineId, AnimationTickType),
+    TickAllAnimations(Vec<WebViewId>),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId, bool /* success */),
@@ -256,7 +256,7 @@ pub enum DocumentState {
 }
 
 /// Input events from the embedder that are sent via the `Constellation`` to the `ScriptThread`.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConstellationInputEvent {
     /// The hit test result of this input event, if any.
     pub hit_test_result: Option<CompositorHitTestResult>,
@@ -318,8 +318,6 @@ pub struct InitialScriptState {
     pub webgl_chan: Option<WebGLPipeline>,
     /// The XR device registry
     pub webxr_registry: Option<webxr_api::Registry>,
-    /// The Webrender document ID associated with this thread.
-    pub webrender_document: DocumentId,
     /// Access to the compositor across a process boundary.
     pub compositor_api: CrossProcessCompositorApi,
     /// Application window's GL Context for Media player

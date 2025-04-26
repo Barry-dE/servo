@@ -58,7 +58,7 @@ TOML_GLOBS = [
     "*.toml",
     ".cargo/*.toml",
     "components/*/*.toml",
-    "components/shared/*.toml",
+    "components/shared/*/*.toml",
     "ports/*/*.toml",
     "support/*/*.toml",
 ]
@@ -168,7 +168,7 @@ class MachCommands(CommandBase):
             "devtools",
             "fonts",
             "hyper_serde",
-            "layout_2020",
+            "layout",
             "libservo",
             "metrics",
             "net",
@@ -672,6 +672,12 @@ class MachCommands(CommandBase):
                                     '<meta charset=utf-8>\n<meta name="timeout" content="long">')
         # Write the file out again
         with open(cts_html, 'w') as file:
+            file.write(filedata)
+        logger = path.join(clone_dir, "out-wpt", "common/internal/logging/test_case_recorder.js")
+        with open(logger, 'r') as file:
+            filedata = file.read()
+        filedata.replace("info(ex) {", "info(ex) {return;")
+        with open(logger, 'w') as file:
             file.write(filedata)
         # copy
         delete(path.join(tdir, "webgpu"))

@@ -4,11 +4,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::ptr;
 use std::rc::Rc;
 
-use base::id::{MessagePortId, MessagePortIndex, PipelineNamespaceId};
+use base::id::{MessagePortId, MessagePortIndex};
 use constellation_traits::{MessagePortImpl, PortMessageTask};
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JS_NewObject, JSObject};
@@ -20,13 +19,13 @@ use crate::dom::bindings::codegen::Bindings::MessagePortBinding::{
     MessagePortMethods, StructuredSerializeOptions,
 };
 use crate::dom::bindings::conversions::root_from_object;
-use crate::dom::bindings::error::{Error, ErrorResult};
+use crate::dom::bindings::error::{Error, ErrorResult, ErrorToJsval};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::structuredclone::{self, StructuredData, StructuredDataReader};
+use crate::dom::bindings::structuredclone::{self, StructuredData};
 use crate::dom::bindings::trace::RootedTraceableBox;
-use crate::dom::bindings::transferable::{ExtractComponents, IdFromComponents, Transferable};
+use crate::dom::bindings::transferable::Transferable;
 use crate::dom::bindings::utils::set_dictionary_property;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -180,14 +179,13 @@ impl MessagePort {
         let result = self.pack_and_post_message(type_, value, can_gc);
 
         // If result is an abrupt completion,
-        if result.is_err() {
+        if let Err(error) = result.as_ref() {
             // Perform ! CrossRealmTransformSendError(port, result.[[Value]]).
-            // Note: we send UndefinedValue across,
-            // because somehow sending an error results in another error.
-            // The Error::DataClone, which is the only one that is sent across,
-            // will be created upon receipt.
             let cx = GlobalScope::get_cx();
             rooted!(in(*cx) let mut rooted_error = UndefinedValue());
+            error
+                .clone()
+                .to_jsval(cx, &self.global(), rooted_error.handle_mut(), can_gc);
             self.cross_realm_transform_send_error(rooted_error.handle(), can_gc);
         }
 
@@ -240,7 +238,7 @@ impl MessagePort {
 }
 
 impl Transferable for MessagePort {
-    type Id = MessagePortId;
+    type Index = MessagePortIndex;
     type Data = MessagePortImpl;
 
     /// <https://html.spec.whatwg.org/multipage/#message-ports:transfer-steps>
@@ -270,30 +268,13 @@ impl Transferable for MessagePort {
         Ok(transferred_port)
     }
 
-    fn serialized_storage(data: StructuredData<'_>) -> &mut Option<HashMap<Self::Id, Self::Data>> {
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,
         }
-    }
-
-    fn deserialized_storage(reader: &mut StructuredDataReader) -> &mut Option<Vec<DomRoot<Self>>> {
-        &mut reader.message_ports
-    }
-}
-
-impl IdFromComponents for MessagePortId {
-    fn from(namespace_id: PipelineNamespaceId, index: NonZeroU32) -> MessagePortId {
-        MessagePortId {
-            namespace_id,
-            index: MessagePortIndex(index),
-        }
-    }
-}
-
-impl ExtractComponents for MessagePortId {
-    fn components(&self) -> (PipelineNamespaceId, NonZeroU32) {
-        (self.namespace_id, self.index.0)
     }
 }
 

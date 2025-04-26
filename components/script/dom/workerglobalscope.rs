@@ -12,6 +12,7 @@ use std::time::Duration;
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::{PipelineId, PipelineNamespace};
 use constellation_traits::WorkerGlobalScopeInit;
+use content_security_policy::CspList;
 use crossbeam_channel::Receiver;
 use devtools_traits::{DevtoolScriptControlMsg, WorkerId};
 use dom_struct::dom_struct;
@@ -25,7 +26,7 @@ use net_traits::request::{
     CredentialsMode, Destination, InsecureRequestsPolicy, ParserMetadata,
     RequestBuilder as NetRequestInit,
 };
-use profile_traits::mem::ProcessReports;
+use profile_traits::mem::{ProcessReports, perform_memory_report};
 use servo_url::{MutableOrigin, ServoUrl};
 use timers::TimerScheduler;
 use uuid::Uuid;
@@ -246,6 +247,10 @@ impl WorkerGlobalScope {
         self.policy_container.borrow()
     }
 
+    pub(crate) fn set_csp_list(&self, csp_list: Option<CspList>) {
+        self.policy_container.borrow_mut().set_csp_list(csp_list);
+    }
+
     /// Get a mutable reference to the [`TimerScheduler`] for this [`ServiceWorkerGlobalScope`].
     pub(crate) fn timer_scheduler(&self) -> RefMut<TimerScheduler> {
         self.timer_scheduler.borrow_mut()
@@ -300,6 +305,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             .use_url_credentials(true)
             .origin(global_scope.origin().immutable().clone())
             .insecure_requests_policy(self.insecure_requests_policy())
+            .policy_container(global_scope.policy_container())
             .has_trustworthy_ancestor_origin(
                 global_scope.has_trustworthy_ancestor_or_current_origin(),
             )
@@ -546,8 +552,10 @@ impl WorkerGlobalScope {
             CommonScriptMsg::Task(_, task, _, _) => task.run_box(),
             CommonScriptMsg::CollectReports(reports_chan) => {
                 let cx = self.get_cx();
-                let reports = cx.get_reports(format!("url({})", self.get_url()));
-                reports_chan.send(ProcessReports::new(reports));
+                perform_memory_report(|ops| {
+                    let reports = cx.get_reports(format!("url({})", self.get_url()), ops);
+                    reports_chan.send(ProcessReports::new(reports));
+                });
             },
         }
         true

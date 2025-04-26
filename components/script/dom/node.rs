@@ -21,7 +21,7 @@ use dom_struct::dom_struct;
 use embedder_traits::UntrustedNodeAddress;
 use euclid::default::{Rect, Size2D, Vector2D};
 use html5ever::serialize::HtmlSerializer;
-use html5ever::{Namespace, Prefix, QualName, namespace_url, ns, serialize as html_serialize};
+use html5ever::{Namespace, Prefix, QualName, ns, serialize as html_serialize};
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use libc::{self, c_void, uintptr_t};
@@ -167,7 +167,6 @@ pub struct Node {
 
     /// Layout data for this node. This is populated during layout and can
     /// be used for incremental relayout and script queries.
-    #[ignore_malloc_size_of = "trait object"]
     #[no_trace]
     layout_data: DomRefCell<Option<Box<GenericLayoutData>>>,
 }

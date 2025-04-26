@@ -83,8 +83,8 @@ use style::stylesheets::UrlExtraData;
 use style_traits::CSSPixel;
 use stylo_atoms::Atom;
 use url::Position;
+use webrender_api::ExternalScrollId;
 use webrender_api::units::{DevicePixel, LayoutPixel};
-use webrender_api::{DocumentId, ExternalScrollId};
 
 use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use super::bindings::trace::HashMapTracedValues;
@@ -353,10 +353,6 @@ pub(crate) struct Window {
     test_worklet: MutNullableDom<Worklet>,
     /// <https://drafts.css-houdini.org/css-paint-api-1/#paint-worklet>
     paint_worklet: MutNullableDom<Worklet>,
-    /// The Webrender Document id associated with this window.
-    #[ignore_malloc_size_of = "defined in webrender_api"]
-    #[no_trace]
-    webrender_document: DocumentId,
 
     /// Flag to identify whether mutation observers are present(true)/absent(false)
     exists_mut_observer: Cell<bool>,
@@ -1220,12 +1216,23 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         }
     }
 
-    #[allow(unsafe_code)]
-    fn WebdriverCallback(&self, cx: JSContext, val: HandleValue) {
-        let rv = unsafe { jsval_to_webdriver(*cx, &self.globalscope, val) };
+    fn WebdriverCallback(&self, cx: JSContext, val: HandleValue, realm: InRealm, can_gc: CanGc) {
+        let rv = jsval_to_webdriver(cx, &self.globalscope, val, realm, can_gc);
         let opt_chan = self.webdriver_script_chan.borrow_mut().take();
         if let Some(chan) = opt_chan {
             chan.send(rv).unwrap();
+        }
+    }
+
+    fn WebdriverException(&self, cx: JSContext, val: HandleValue, realm: InRealm, can_gc: CanGc) {
+        let rv = jsval_to_webdriver(cx, &self.globalscope, val, realm, can_gc);
+        let opt_chan = self.webdriver_script_chan.borrow_mut().take();
+        if let Some(chan) = opt_chan {
+            if let Ok(rv) = rv {
+                chan.send(Err(WebDriverJSError::JSException(rv))).unwrap();
+            } else {
+                chan.send(rv).unwrap();
+            }
         }
     }
 
@@ -2019,8 +2026,7 @@ impl Window {
             }
 
             let mut images = self.pending_layout_images.borrow_mut();
-            let nodes = images.entry(id).or_default();
-            if !nodes.iter().any(|n| std::ptr::eq(&**n, &*node)) {
+            if !images.contains_key(&id) {
                 let trusted_node = Trusted::new(&*node);
                 let sender = self.register_image_cache_listener(id, move |response| {
                     trusted_node
@@ -2031,6 +2037,10 @@ impl Window {
 
                 self.image_cache
                     .add_listener(ImageResponder::new(sender, self.pipeline_id(), id));
+            }
+
+            let nodes = images.entry(id).or_default();
+            if !nodes.iter().any(|n| std::ptr::eq(&**n, &*node)) {
                 nodes.push(Dom::from_ref(&*node));
             }
         }
@@ -2251,7 +2261,9 @@ impl Window {
 
     // Query content box without considering any reflow
     pub(crate) fn content_box_query_unchecked(&self, node: &Node) -> Option<UntypedRect<Au>> {
-        self.layout.borrow().query_content_box(node.to_opaque())
+        self.layout
+            .borrow()
+            .query_content_box(node.to_trusted_node_address())
     }
 
     pub(crate) fn content_box_query(&self, node: &Node, can_gc: CanGc) -> Option<UntypedRect<Au>> {
@@ -2265,14 +2277,18 @@ impl Window {
         if !self.layout_reflow(QueryMsg::ContentBoxes, can_gc) {
             return vec![];
         }
-        self.layout.borrow().query_content_boxes(node.to_opaque())
+        self.layout
+            .borrow()
+            .query_content_boxes(node.to_trusted_node_address())
     }
 
     pub(crate) fn client_rect_query(&self, node: &Node, can_gc: CanGc) -> UntypedRect<i32> {
         if !self.layout_reflow(QueryMsg::ClientRectQuery, can_gc) {
             return Rect::zero();
         }
-        self.layout.borrow().query_client_rect(node.to_opaque())
+        self.layout
+            .borrow()
+            .query_client_rect(node.to_trusted_node_address())
     }
 
     /// Find the scroll area of the given node, if it is not None. If the node
@@ -2282,11 +2298,12 @@ impl Window {
         node: Option<&Node>,
         can_gc: CanGc,
     ) -> UntypedRect<i32> {
-        let opaque = node.map(|node| node.to_opaque());
         if !self.layout_reflow(QueryMsg::ScrollingAreaQuery, can_gc) {
             return Rect::zero();
         }
-        self.layout.borrow().query_scrolling_area(opaque)
+        self.layout
+            .borrow()
+            .query_scrolling_area(node.map(Node::to_trusted_node_address))
     }
 
     pub(crate) fn scroll_offset_query(&self, node: &Node) -> Vector2D<f32, LayoutPixel> {
@@ -2375,7 +2392,10 @@ impl Window {
             return (None, Rect::zero());
         }
 
-        let response = self.layout.borrow().query_offset_parent(node.to_opaque());
+        let response = self
+            .layout
+            .borrow()
+            .query_offset_parent(node.to_trusted_node_address());
         let element = response.node_address.and_then(|parent_node_address| {
             let node = unsafe { from_untrusted_node_address(parent_node_address) };
             DomRoot::downcast(node)
@@ -2772,10 +2792,6 @@ impl Window {
             .unwrap();
     }
 
-    pub(crate) fn webrender_document(&self) -> DocumentId {
-        self.webrender_document
-    }
-
     #[cfg(feature = "webxr")]
     pub(crate) fn in_immersive_xr_session(&self) -> bool {
         self.navigator
@@ -2818,7 +2834,6 @@ impl Window {
         webgl_chan: Option<WebGLChan>,
         #[cfg(feature = "webxr")] webxr_registry: Option<webxr_api::Registry>,
         microtask_queue: Rc<MicrotaskQueue>,
-        webrender_document: DocumentId,
         compositor_api: CrossProcessCompositorApi,
         relayout_event: bool,
         unminify_js: bool,
@@ -2903,7 +2918,6 @@ impl Window {
             local_script_source,
             test_worklet: Default::default(),
             paint_worklet: Default::default(),
-            webrender_document,
             exists_mut_observer: Cell::new(false),
             compositor_api,
             has_sent_idle_message: Cell::new(false),

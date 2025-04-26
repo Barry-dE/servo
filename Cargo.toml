@@ -92,7 +92,7 @@ log = "0.4"
 mach2 = "0.4"
 malloc_size_of = { package = "servo_malloc_size_of", path = "components/malloc_size_of" }
 malloc_size_of_derive = "0.1"
-markup5ever = "0.16"
+markup5ever = "0.16.1"
 memmap2 = "0.9.5"
 mime = "0.3.13"
 mime_guess = "2.0.5"
@@ -125,9 +125,11 @@ serde_json = "1.0"
 servo-media = { git = "https://github.com/servo/media" }
 servo-media-dummy = { git = "https://github.com/servo/media" }
 servo-media-gstreamer = { git = "https://github.com/servo/media" }
+servo-tracing = { path = "components/servo_tracing" }
 servo_arc = { git = "https://github.com/servo/stylo", branch = "2025-03-15" }
 smallbitvec = "2.6.0"
 smallvec = "1.15"
+snapshot = { path = "./components/shared/snapshot" }
 static_assertions = "1.1"
 string_cache = "0.8"
 string_cache_codegen = "0.5"
@@ -167,8 +169,8 @@ webpki-roots = "0.26"
 webrender = { git = "https://github.com/servo/webrender", branch = "0.66", features = ["capture"] }
 webrender_api = { git = "https://github.com/servo/webrender", branch = "0.66" }
 webxr-api = { path = "components/shared/webxr" }
-wgpu-core = { git = "https://github.com/gfx-rs/wgpu", rev = "2f255edc60e9669c8c737464c59af10d59a31126" }
-wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "2f255edc60e9669c8c737464c59af10d59a31126" }
+wgpu-core = "25"
+wgpu-types = "25"
 winapi = "0.3"
 windows-sys = "0.59"
 wio = "0.2"
@@ -241,3 +243,7 @@ codegen-units = 1
 #
 # [patch."https://github.com/servo/<repository>"]
 # <crate> = { path = "/path/to/local/checkout" }
+#
+# [patch."https://github.com/servo/rust-content-security-policy"]
+# content-security-policy = { path = "../rust-content-security-policy/" }
+# content-security-policy = { git = "https://github.com/timvdlippe/rust-content-security-policy/", branch = "fix-report-checks", features = ["serde"] }

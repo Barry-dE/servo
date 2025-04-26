@@ -50,13 +50,14 @@ use devtools_traits::{
 };
 use embedder_traits::user_content_manager::UserContentManager;
 use embedder_traits::{
-    CompositorHitTestResult, EmbedderMsg, InputEvent, MediaSessionActionType, Theme,
-    ViewportDetails, WebDriverScriptCommand,
+    CompositorHitTestResult, EmbedderMsg, InputEvent, MediaSessionActionType, MouseButton,
+    MouseButtonAction, MouseButtonEvent, Theme, ViewportDetails, WebDriverScriptCommand,
 };
+use euclid::Point2D;
 use euclid::default::Rect;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
-use html5ever::{local_name, namespace_url, ns};
+use html5ever::{local_name, ns};
 use http::header::REFRESH;
 use hyper_serde::Serde;
 use ipc_channel::ipc;
@@ -78,7 +79,7 @@ use net_traits::{
     ResourceFetchTiming, ResourceThreads, ResourceTimingType,
 };
 use percent_encoding::percent_decode;
-use profile_traits::mem::{ProcessReports, ReportsChan};
+use profile_traits::mem::{ProcessReports, ReportsChan, perform_memory_report};
 use profile_traits::time::ProfilerCategory;
 use profile_traits::time_profile;
 use script_layout_interface::{
@@ -97,7 +98,7 @@ use timers::{TimerEventRequest, TimerScheduler};
 use url::Position;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPUDevice, WebGPUMsg};
-use webrender_api::DocumentId;
+use webrender_api::units::DevicePixel;
 
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
@@ -282,10 +283,6 @@ pub struct ScriptThread {
     /// <https://html.spec.whatwg.org/multipage/#custom-element-reactions-stack>
     custom_element_reaction_stack: CustomElementReactionStack,
 
-    /// The Webrender Document ID associated with this thread.
-    #[no_trace]
-    webrender_document: DocumentId,
-
     /// Cross-process access to the compositor's API.
     #[no_trace]
     compositor_api: CrossProcessCompositorApi,
@@ -333,6 +330,11 @@ pub struct ScriptThread {
     /// A factory for making new layouts. This allows layout to depend on script.
     #[no_trace]
     layout_factory: Arc<dyn LayoutFactory>,
+
+    // Mouse down point.
+    // In future, this shall be mouse_down_point for primary button
+    #[no_trace]
+    relative_mouse_down_point: Cell<Point2D<f32, DevicePixel>>,
 }
 
 struct BHMExitSignal {
@@ -931,7 +933,6 @@ impl ScriptThread {
             worklet_thread_pool: Default::default(),
             docs_with_no_blocking_loads: Default::default(),
             custom_element_reaction_stack: CustomElementReactionStack::new(),
-            webrender_document: state.webrender_document,
             compositor_api: state.compositor_api,
             profile_script_events: opts.debug.profile_script_events,
             print_pwm: opts.print_pwm,
@@ -947,6 +948,7 @@ impl ScriptThread {
             gpu_id_hub: Arc::new(IdentityHub::default()),
             inherited_secure_context: state.inherited_secure_context,
             layout_factory,
+            relative_mouse_down_point: Cell::new(Point2D::zero()),
         }
     }
 
@@ -1145,14 +1147,6 @@ impl ScriptThread {
             return;
         }
 
-        // Run rafs for all pipeline, if a raf tick was received for any.
-        // This ensures relative ordering of rafs between parent doc and iframes.
-        let should_run_rafs = self
-            .documents
-            .borrow()
-            .iter()
-            .any(|(_, doc)| doc.is_fully_active() && doc.has_received_raf_tick());
-
         let any_animations_running = self.documents.borrow().iter().any(|(_, document)| {
             document.is_fully_active() && document.animations().running_animation_count() != 0
         });
@@ -1240,7 +1234,7 @@ impl ScriptThread {
             // > 14. For each doc of docs, run the animation frame callbacks for doc, passing
             // > in the relative high resolution time given frameTimestamp and doc's
             // > relevant global object as the timestamp.
-            if should_run_rafs {
+            if requested_by_compositor {
                 document.run_the_animation_frame_callbacks(can_gc);
             }
 
@@ -1419,18 +1413,9 @@ impl ScriptThread {
                         self.handle_viewport(id, rect);
                     }),
                 MixedMessage::FromConstellation(ScriptThreadMessage::TickAllAnimations(
-                    pipeline_id,
-                    tick_type,
+                    _webviews,
                 )) => {
-                    if let Some(document) = self.documents.borrow().find_document(pipeline_id) {
-                        document.note_pending_animation_tick(tick_type);
-                        compositor_requested_update_the_rendering = true;
-                    } else {
-                        warn!(
-                            "Trying to note pending animation tick for closed pipeline {}.",
-                            pipeline_id
-                        )
-                    }
+                    compositor_requested_update_the_rendering = true;
                 },
                 MixedMessage::FromConstellation(ScriptThreadMessage::SendInputEvent(id, event)) => {
                     self.handle_input_event(id, event)
@@ -2289,6 +2274,7 @@ impl ScriptThread {
                     node_id,
                     name,
                     reply,
+                    can_gc,
                 )
             },
             WebDriverScriptCommand::GetElementCSS(node_id, name, reply) => {
@@ -2435,13 +2421,20 @@ impl ScriptThread {
         let documents = self.documents.borrow();
         let urls = itertools::join(documents.iter().map(|(_, d)| d.url().to_string()), ", ");
 
-        let prefix = format!("url({urls})");
-        let mut reports = self.get_cx().get_reports(prefix.clone());
-        for (_, document) in documents.iter() {
-            document.window().layout().collect_reports(&mut reports);
-        }
+        let mut reports = vec![];
+        perform_memory_report(|ops| {
+            for (_, document) in documents.iter() {
+                document
+                    .window()
+                    .layout()
+                    .collect_reports(&mut reports, ops);
+            }
 
-        reports.push(self.image_cache.memory_report(&prefix));
+            let prefix = format!("url({urls})");
+            reports.extend(self.get_cx().get_reports(prefix.clone(), ops));
+
+            reports.push(self.image_cache.memory_report(&prefix, ops));
+        });
 
         reports_chan.send(ProcessReports::new(reports));
     }
@@ -3122,7 +3115,6 @@ impl ScriptThread {
             #[cfg(feature = "webxr")]
             self.webxr_registry.clone(),
             self.microtask_queue.clone(),
-            self.webrender_document,
             self.compositor_api.clone(),
             self.relayout_event,
             self.unminify_js,
@@ -3333,6 +3325,50 @@ impl ScriptThread {
             warn!("Compositor event sent to closed pipeline {pipeline_id}.");
             return;
         };
+
+        // Also send a 'click' event with same hit-test result if this is release
+
+        // MAYBE? TODO: https://developer.mozilla.org/en-US/docs/Web/API/Element/click_event
+        // If the button is pressed on one element and the pointer is moved outside the element
+        // before the button is released, the event is fired on the most specific ancestor element
+        // that contained both elements.
+
+        // But spec doesn't specify this https://w3c.github.io/uievents/#event-type-click
+        // "The click event type MUST be dispatched on the topmost event target indicated by
+        // the pointer, when the user presses down and releases the primary pointer button"
+
+        // Servo-specific: Trigger if within 10px of the down point
+        if let InputEvent::MouseButton(mouse_button_event) = event.event {
+            if let MouseButton::Left = mouse_button_event.button {
+                match mouse_button_event.action {
+                    MouseButtonAction::Up => {
+                        let pixel_dist =
+                            self.relative_mouse_down_point.get() - mouse_button_event.point;
+                        let pixel_dist =
+                            (pixel_dist.x * pixel_dist.x + pixel_dist.y * pixel_dist.y).sqrt();
+                        if pixel_dist < 10.0 * document.window().device_pixel_ratio().get() {
+                            document.note_pending_input_event(event.clone());
+                            document.note_pending_input_event(ConstellationInputEvent {
+                                hit_test_result: event.hit_test_result,
+                                pressed_mouse_buttons: event.pressed_mouse_buttons,
+                                active_keyboard_modifiers: event.active_keyboard_modifiers,
+                                event: InputEvent::MouseButton(MouseButtonEvent {
+                                    action: MouseButtonAction::Click,
+                                    button: mouse_button_event.button,
+                                    point: mouse_button_event.point,
+                                }),
+                            });
+                            return;
+                        }
+                    },
+                    MouseButtonAction::Down => {
+                        self.relative_mouse_down_point.set(mouse_button_event.point)
+                    },
+                    MouseButtonAction::Click => {},
+                }
+            }
+        }
+
         document.note_pending_input_event(event);
     }
 

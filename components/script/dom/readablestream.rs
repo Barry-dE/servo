@@ -8,6 +8,8 @@ use std::ptr::{self};
 use std::rc::Rc;
 use std::collections::HashMap;
 
+use base::id::{MessagePortId, MessagePortIndex};
+use constellation_traits::MessagePortImpl;
 use dom_struct::dom_struct;
 use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
@@ -56,10 +58,8 @@ use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use base::id::MessagePortId;
-use constellation_traits::MessagePortImpl;
 use crate::dom::bindings::transferable::Transferable;
-use crate::dom::bindings::structuredclone::{StructuredData, StructuredDataReader};
+use crate::dom::bindings::structuredclone::StructuredData;
 
 use super::bindings::buffer_source::HeapBufferSource;
 use super::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::ReadableStreamBYOBReaderReadOptions;
@@ -845,7 +845,7 @@ impl ReadableStream {
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    fn new_with_proto(
+    pub(crate) fn new_with_proto(
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
         can_gc: CanGc,
@@ -1619,7 +1619,7 @@ impl ReadableStream {
 
     /// <https://streams.spec.whatwg.org/#readable-stream-pipe-to>
     #[allow(clippy::too_many_arguments)]
-    fn pipe_to(
+    pub(crate) fn pipe_to(
         &self,
         cx: SafeJSContext,
         global: &GlobalScope,
@@ -1782,7 +1782,7 @@ impl ReadableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
-    fn setup_cross_realm_transform_readable(
+    pub(crate) fn setup_cross_realm_transform_readable(
         &self,
         cx: SafeJSContext,
         port: &MessagePort,
@@ -2088,19 +2088,8 @@ impl CrossRealmTransformReadable {
 
         // Otherwise, if type is "error",
         if type_string == "error" {
-            if value.is_undefined() {
-                // Note: for DataClone errors, we send UndefinedValue across,
-                // because somehow sending the error results in another error.
-                // The error is then created here.
-                rooted!(in(*cx) let mut rooted_error = UndefinedValue());
-                Error::DataClone(None).to_jsval(cx, global, rooted_error.handle_mut(), can_gc);
-
-                // Perform ! ReadableStreamDefaultControllerError(controller, value).
-                self.controller.error(rooted_error.handle(), can_gc);
-            } else {
-                // Perform ! ReadableStreamDefaultControllerError(controller, value).
-                self.controller.error(value.handle(), can_gc);
-            }
+            // Perform ! ReadableStreamDefaultControllerError(controller, value).
+            self.controller.error(value.handle(), can_gc);
 
             // Disentangle port.
             global.disentangle_port(port);
@@ -2190,7 +2179,7 @@ pub(crate) fn get_read_promise_bytes(
 
 /// <https://streams.spec.whatwg.org/#rs-transfer>
 impl Transferable for ReadableStream {
-    type Id = MessagePortId;
+    type Index = MessagePortIndex;
     type Data = MessagePortImpl;
 
     /// <https://streams.spec.whatwg.org/#ref-for-readablestream%E2%91%A1%E2%91%A0>
@@ -2258,14 +2247,12 @@ impl Transferable for ReadableStream {
     }
 
     /// Note: we are relying on the port transfer, so the data returned here are related to the port.
-    fn serialized_storage(data: StructuredData<'_>) -> &mut Option<HashMap<Self::Id, Self::Data>> {
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,
         }
-    }
-
-    fn deserialized_storage(reader: &mut StructuredDataReader) -> &mut Option<Vec<DomRoot<Self>>> {
-        &mut reader.readable_streams
     }
 }
